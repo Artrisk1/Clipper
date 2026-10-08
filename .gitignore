@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
+
+# Output clips and yt-dlp leftovers
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.part
+*.ytdl
+clips/
+
+# Browser cookies exported for yt-dlp (credentials: never commit)
+cookies*.txt
+*.cookies
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,7 @@
+# Runtime dependencies (also used by Streamlit Community Cloud).
+# yt-dlp must stay current: YouTube changes often and old versions break.
+# The [default] extra bundles yt-dlp-ejs, which solves YouTube's JS challenges.
+yt-dlp[default]>=2025.11.12
+# JavaScript runtime required by yt-dlp for YouTube (installs a deno binary).
+deno>=2.3
+streamlit>=1.50

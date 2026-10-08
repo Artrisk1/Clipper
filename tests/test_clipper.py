@@ -332,6 +332,75 @@ def test_clip_video_validates_before_network(fake_ydl, tmp_path):
     assert fake_ydl.instances == []
 
 
+def test_clip_video_scaling_options(fake_ydl, tmp_path):
+    clipper.download_section(
+        "https://www.youtube.com/watch?v=x",
+        0,
+        3,
+        tmp_path / "c.mp4",
+        threads=2,
+        encoder_preset="veryfast",
+    )
+    assert fake_ydl.instances[0].params["external_downloader_args"] == {
+        "ffmpeg_o": ["-threads", "2", "-preset", "veryfast"]
+    }
+    # No preset when stream-copying (nothing is encoded).
+    clipper.download_section(
+        "https://www.youtube.com/watch?v=x",
+        0,
+        3,
+        tmp_path / "d.mp4",
+        threads=1,
+        encoder_preset="veryfast",
+        precise=False,
+    )
+    assert fake_ydl.instances[1].params["external_downloader_args"] == {
+        "ffmpeg_o": ["-threads", "1"]
+    }
+
+
+class CountingYDL(FakeYDL):
+    extract_calls = 0
+    fail_next_download = False
+
+    def extract_info(self, url, download=False):
+        CountingYDL.extract_calls += 1
+        return super().extract_info(url, download)
+
+    def sanitize_info(self, info):
+        return dict(info)
+
+    def process_ie_result(self, info, download=True):
+        if CountingYDL.fail_next_download:
+            CountingYDL.fail_next_download = False
+            raise DownloadError("ERROR: HTTP Error 403: Forbidden")
+        return super().process_ie_result(info, download)
+
+
+def test_info_cache_reuses_metadata_and_recovers_from_stale(fake_ydl, monkeypatch, tmp_path):
+    monkeypatch.setattr(clipper.yt_dlp, "YoutubeDL", CountingYDL)
+    CountingYDL.extract_calls = 0
+    cache: dict = {}
+    url = f"https://www.youtube.com/watch?v={VID}"
+    clipper.download_section(url, 0, 5, tmp_path / "a.mp4", info_cache=cache)
+    clipper.download_section(url, 5, 10, tmp_path / "b.mp4", info_cache=cache)
+    assert CountingYDL.extract_calls == 1
+    assert url in cache
+
+    # Cached metadata with an expired stream URL: dropped, refetched, succeeds.
+    CountingYDL.fail_next_download = True
+    clipper.download_section(url, 10, 15, tmp_path / "c.mp4", info_cache=cache)
+    assert CountingYDL.extract_calls == 2
+    assert (tmp_path / "c.mp4").read_bytes() == b"fake-video"
+
+
+def test_info_cache_still_validates_duration(fake_ydl, tmp_path):
+    url = f"https://www.youtube.com/watch?v={VID}"
+    cache = {url: {"id": VID, "title": "t", "duration": 60}}
+    with pytest.raises(clipper.InvalidTimestampError, match="past the end"):
+        clipper.download_section(url, 30, 120, tmp_path / "a.mp4", info_cache=cache)
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -485,6 +554,39 @@ def test_integration_fast_section(local_video_server, tmp_path):
     out = tmp_path / "fast.mkv"
     clipper.download_section(url, 5.0, 9.5, out, precise=False)
     assert out.exists() and _probe_duration(out) > 0
+
+
+@needs_ffmpeg
+def test_integration_service_concurrent_users(local_video_server, tmp_path):
+    """Real yt-dlp + ffmpeg through ClipService: threads/preset flags, metadata
+    cache, queue and de-duplication all working together."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from service import ClipService, ServiceConfig
+
+    url, _ = local_video_server
+
+    def local_download(_youtube_url, *args, **kwargs):
+        return clipper.download_section(url, *args, **kwargs)
+
+    svc = ClipService(
+        ServiceConfig(cache_dir=tmp_path / "cache", max_concurrent_jobs=2, ffmpeg_threads=1),
+        downloader=local_download,
+    )
+    # 6 users: 3 distinct clips, each requested twice at the same moment.
+    ranges = [(2, 4), (5, 8), (10, 11.5)] * 2
+    with ThreadPoolExecutor(6) as pool:
+        clips = list(
+            pool.map(
+                lambda r: svc.get_clip(f"https://youtu.be/{VID}", *r[1], user_id=str(r[0])),
+                enumerate(ranges),
+            )
+        )
+    for clip in clips:
+        assert _probe_duration(clip.path) == pytest.approx(clip.end - clip.start, abs=0.15)
+    assert svc.cache.stats()["entries"] == 3
+    assert svc.stats()["youtube_fetches_last_hour"] == 3
+    assert len(svc.info_cache) == 1  # metadata fetched once, reused
 
 
 # --------------------------------------------------------------------------- #

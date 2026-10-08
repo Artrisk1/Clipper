@@ -1,31 +1,35 @@
 """Streamlit web UI for the YouTube clipper.
 
 Run locally with:  streamlit run app.py
+
+All sessions share one :class:`service.ClipService` (queue, cache, rate limits);
+see service.py for how that keeps a single small server usable by many people.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
-import tempfile
+import uuid
 from pathlib import Path
 
 import streamlit as st
 
 import clipper
+from service import CachedClip, ClipService, ServiceConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("clipper.app")
 
-# Limits protect the (small) server from memory exhaustion: the finished clip is
-# held in memory so it can be previewed and downloaded. Override with env vars.
-MAX_CLIP_SECONDS = float(os.environ.get("CLIPPER_MAX_CLIP_SECONDS", 600))
-MAX_FILE_MB = float(os.environ.get("CLIPPER_MAX_FILE_MB", 200))
-
 QUALITY_OPTIONS = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
 
 st.set_page_config(page_title="YouTube Clipper", page_icon="🎬", layout="centered")
+
+
+@st.cache_resource
+def get_service() -> ClipService:
+    """One service per server process, shared by every user session."""
+    return ClipService(ServiceConfig.from_env())
 
 
 @st.cache_data(show_spinner=False)
@@ -38,52 +42,77 @@ def ffmpeg_status() -> str | None:
     return None
 
 
+def user_id() -> str:
+    """A random per-browser-session ID used for per-user rate limiting."""
+    if "user_id" not in st.session_state:
+        st.session_state.user_id = uuid.uuid4().hex
+    return st.session_state.user_id
+
+
 def safe_filename(title: str, start: float, end: float) -> str:
     stem = re.sub(r"[^\w\- ]+", "", title).strip().replace(" ", "_")[:60] or "clip"
     stamp = f"{clipper.format_timestamp(start)}-{clipper.format_timestamp(end)}".replace(":", "-")
     return f"{stem}_{stamp}.mp4"
 
 
-def run_clip(url: str, start_s: float, end_s: float, max_height: int, precise: bool) -> None:
-    """Clip into a temp dir, load the bytes into session state, and delete the file."""
-    with (
-        st.status("Clipping video…", expanded=True) as status,
-        tempfile.TemporaryDirectory(prefix="clipper-app-") as tmp,
-    ):
+def run_clip(
+    service: ClipService, url: str, start: str, end: str, max_height: int, precise: bool
+) -> None:
+    with st.status("Clipping video…", expanded=True) as status:
+        message = st.empty()  # one line that updates in place (queue position etc.)
         try:
-            result = clipper.clip_video(
+            clip = service.get_clip(
                 url,
-                start_s,
-                end_s,
-                Path(tmp) / "clip.mp4",
-                precise=precise,
+                start,
+                end,
+                user_id=user_id(),
                 max_height=max_height,
-                max_clip_seconds=MAX_CLIP_SECONDS,
-                status=st.write,
+                precise=precise,
+                status=message.write,
             )
-            size_mb = result.path.stat().st_size / 1_048_576
-            if size_mb > MAX_FILE_MB:
-                raise clipper.ClipperError(
-                    f"The clip is {size_mb:.0f} MB, above this server's {MAX_FILE_MB:.0f} MB "
-                    "limit. Choose a shorter range or lower quality."
-                )
-            st.session_state.clip = {
-                "data": result.path.read_bytes(),
-                "filename": safe_filename(result.title, result.start, result.end),
-                "title": result.title,
-                "start": result.start,
-                "end": result.end,
-                "size_mb": size_mb,
-            }
-            status.update(label="Clip ready!", state="complete", expanded=False)
         except clipper.ClipperError as exc:
             status.update(label="Could not create the clip", state="error", expanded=False)
             st.session_state.error = str(exc)
+            return
         except Exception:  # noqa: BLE001 - last-resort guard so the UI never shows a raw trace
             log.exception("Unexpected error while clipping %s", url)
             status.update(label="Unexpected error", state="error", expanded=False)
             st.session_state.error = "An unexpected error occurred. Please try again later."
-    # Leaving the `with` block deletes the temporary directory and its files.
+            return
+        label = "Clip ready! (served from cache ⚡)" if clip.from_cache else "Clip ready!"
+        status.update(label=label, state="complete", expanded=False)
+        # Only the path is stored per session; the bytes stay on disk in the shared cache.
+        st.session_state.clip = clip
+
+
+def show_clip(clip: CachedClip) -> None:
+    path = Path(clip.path)
+    if not path.exists():
+        st.info("This clip has expired from the server cache. Please create it again.")
+        st.session_state.pop("clip", None)
+        return
+    st.subheader(clip.title)
+    st.caption(
+        f"{clipper.format_timestamp(clip.start)} → {clipper.format_timestamp(clip.end)}"
+        f" · {clip.end - clip.start:.1f} s · {clip.size_mb:.1f} MB"
+    )
+    # Streamlit de-duplicates identical media, so many viewers of one cached clip
+    # share a single in-memory copy.
+    st.video(str(path), format="video/mp4")
+    col_dl, col_clear = st.columns([3, 1])
+    col_dl.download_button(
+        "⬇️ Download MP4",
+        # Deferred: the file is read only when the button is clicked.
+        data=path.read_bytes,
+        file_name=safe_filename(clip.title, clip.start, clip.end),
+        mime="video/mp4",
+        type="primary",
+        on_click="ignore",
+        width="stretch",
+    )
+    if col_clear.button("Clear", width="stretch"):
+        st.session_state.pop("clip", None)
+        st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +127,9 @@ st.caption(
 if missing := ffmpeg_status():
     st.error(f"Server configuration problem: {missing}")
     st.stop()
+
+service = get_service()
+config = service.config
 
 with st.form("clip_form"):
     url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=…")
@@ -117,42 +149,27 @@ with st.form("clip_form"):
 if submitted:
     st.session_state.pop("clip", None)
     st.session_state.pop("error", None)
-    try:
-        clipper.extract_video_id(url)
-        start_s = clipper.parse_timestamp(start_text)
-        end_s = clipper.parse_timestamp(end_text)
-        clipper.validate_range(start_s, end_s, MAX_CLIP_SECONDS)
-    except clipper.ClipperError as exc:
-        st.session_state.error = str(exc)
-    else:
-        run_clip(url, start_s, end_s, QUALITY_OPTIONS[quality], precise)
+    run_clip(service, url, start_text, end_text, QUALITY_OPTIONS[quality], precise)
 
 if error := st.session_state.get("error"):
     st.error(error)
 
 if clip := st.session_state.get("clip"):
-    st.subheader(clip["title"])
-    st.caption(
-        f"{clipper.format_timestamp(clip['start'])} → {clipper.format_timestamp(clip['end'])}"
-        f" · {clip['end'] - clip['start']:.1f} s · {clip['size_mb']:.1f} MB"
-    )
-    st.video(clip["data"], format="video/mp4")
-    col_dl, col_clear = st.columns([3, 1])
-    col_dl.download_button(
-        "⬇️ Download MP4",
-        data=clip["data"],
-        file_name=clip["filename"],
-        mime="video/mp4",
-        type="primary",
-        width="stretch",
-    )
-    if col_clear.button("Clear", width="stretch"):
-        # Drop the clip bytes from server memory.
-        st.session_state.pop("clip", None)
-        st.rerun()
+    show_clip(clip)
 
 st.divider()
+with st.expander("Server status"):
+    stats = service.stats()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Jobs running", f"{stats['active']} / {stats['max_concurrent']}")
+    c2.metric("Waiting in queue", stats["waiting"])
+    c3.metric(
+        "YouTube fetches (1 h)",
+        f"{stats['youtube_fetches_last_hour']} / {stats['youtube_fetch_budget']}",
+    )
+    st.caption(f"Cache: {stats['cache']['entries']} clips, {stats['cache']['mb']:.0f} MB")
 st.caption(
-    f"Limits on this server: clips up to {clipper.format_timestamp(MAX_CLIP_SECONDS)} and "
-    f"{MAX_FILE_MB:.0f} MB. Only clip videos you have the right to download."
+    f"Limits: clips up to {clipper.format_timestamp(config.max_clip_seconds)} and "
+    f"{config.max_file_mb:.0f} MB; {config.user_clips_per_hour} new clips per user per hour. "
+    "Only clip videos you have the right to download."
 )

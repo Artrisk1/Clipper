@@ -20,6 +20,7 @@ The module is also imported by the Streamlit UI (``app.py``).
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import math
 import os
@@ -28,7 +29,7 @@ import shutil
 import sys
 import sysconfig
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -364,6 +365,9 @@ def download_section(
     ffmpeg_location: str | None = None,
     overwrite: bool = False,
     status: Callable[[str], None] | None = None,
+    threads: int | None = None,
+    encoder_preset: str | None = None,
+    info_cache: MutableMapping[str, dict] | None = None,
 ) -> ClipResult:
     """Download only ``[start, end)`` of ``source_url`` into ``output``.
 
@@ -371,6 +375,16 @@ def download_section(
     intermediate files live in a private temporary directory that is removed on
     success, failure or interruption; only the finished clip is moved to
     ``output``.
+
+    Options for servers handling many users:
+
+    * ``threads`` caps ffmpeg's CPU threads so concurrent jobs share cores.
+    * ``encoder_preset`` (e.g. ``"veryfast"``) speeds up H.264 re-encoding in
+      precise mode at the cost of slightly larger files.
+    * ``info_cache`` is a mapping (e.g. a TTL cache) used to reuse video
+      metadata between clips of the same video, halving requests to YouTube.
+      Stream URLs expire after a few hours, so keep its TTL short; a stale
+      entry is dropped and fetched again automatically.
     """
     notify = status or (lambda _msg: None)
     output = Path(output).expanduser().resolve()
@@ -420,27 +434,17 @@ def download_section(
             opts["cookiefile"] = str(Path(cookies_file).expanduser())
         if ffmpeg_location:
             opts["ffmpeg_location"] = ffmpeg_location
+        ffmpeg_out_args: list[str] = []
+        if threads:
+            ffmpeg_out_args += ["-threads", str(int(threads))]
+        if precise and encoder_preset and container in (".mp4", ".mkv"):
+            ffmpeg_out_args += ["-preset", encoder_preset]  # libx264 preset
+        if ffmpeg_out_args:
+            opts["external_downloader_args"] = {"ffmpeg_o": ffmpeg_out_args}
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                notify("Fetching video information…")
-                info = ydl.extract_info(source_url, download=False)
-                if info is None:
-                    raise DownloadFailedError("yt-dlp returned no information for this URL.")
-                if info.get("_type") == "playlist":
-                    raise InvalidURLError("Playlists are not supported; paste a single video URL.")
-                if info.get("is_live"):
-                    raise ClipperError("Live streams cannot be clipped until the broadcast ends.")
-
-                duration = info.get("duration")
-                if duration and end > duration:
-                    raise InvalidTimestampError(
-                        f"End ({format_timestamp(end)}) is past the end of the video "
-                        f"({format_timestamp(duration)})."
-                    )
-
-                notify(f"Downloading {format_timestamp(start)} → {format_timestamp(end)}…")
-                ydl.process_ie_result(info, download=True)
+                info = _download_with_info(ydl, source_url, start, end, info_cache, tmp_dir, notify)
         except ClipperError:
             raise
         except DownloadError as exc:
@@ -461,6 +465,57 @@ def download_section(
         start=start,
         end=end,
     )
+
+
+def _download_with_info(
+    ydl: yt_dlp.YoutubeDL,
+    source_url: str,
+    start: float,
+    end: float,
+    info_cache: MutableMapping[str, dict] | None,
+    tmp_dir: Path,
+    notify: Callable[[str], None],
+) -> dict:
+    """Fetch (or reuse cached) metadata, validate it, then download the section."""
+    cached = info_cache.get(source_url) if info_cache is not None else None
+    if cached is not None:
+        try:
+            info = copy.deepcopy(cached)
+            _validate_info(info, end)
+            notify(f"Downloading {format_timestamp(start)} → {format_timestamp(end)}…")
+            ydl.process_ie_result(info, download=True)
+            return info
+        except DownloadError as exc:
+            # Most likely an expired stream URL: forget it and start over.
+            logger.info("Cached metadata failed (%s); refetching", exc)
+            info_cache.pop(source_url, None)  # type: ignore[union-attr]
+            for leftover in tmp_dir.iterdir():
+                if leftover.is_file():
+                    leftover.unlink()
+
+    notify("Fetching video information…")
+    info = ydl.extract_info(source_url, download=False)
+    if info is None:
+        raise DownloadFailedError("yt-dlp returned no information for this URL.")
+    _validate_info(info, end)
+    if info_cache is not None:
+        info_cache[source_url] = ydl.sanitize_info(info)
+    notify(f"Downloading {format_timestamp(start)} → {format_timestamp(end)}…")
+    ydl.process_ie_result(info, download=True)
+    return info
+
+
+def _validate_info(info: dict, end: float) -> None:
+    if info.get("_type") == "playlist":
+        raise InvalidURLError("Playlists are not supported; paste a single video URL.")
+    if info.get("is_live"):
+        raise ClipperError("Live streams cannot be clipped until the broadcast ends.")
+    duration = info.get("duration")
+    if duration and end > duration:
+        raise InvalidTimestampError(
+            f"End ({format_timestamp(end)}) is past the end of the video "
+            f"({format_timestamp(duration)})."
+        )
 
 
 def _find_output(tmp_dir: Path, container: str) -> Path:

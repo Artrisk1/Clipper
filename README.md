@@ -19,6 +19,7 @@ Built on [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and [`ffmpeg`](https://ffm
 - [Local installation](#local-installation)
 - [CLI usage](#cli-usage)
 - [Web UI (Streamlit)](#web-ui-streamlit)
+- [Serving many users](#serving-many-users)
 - [Running tests and linting](#running-tests-and-linting)
 - [GitHub setup and CI](#github-setup-and-ci)
 - [Deploying to Streamlit Community Cloud](#deploying-to-streamlit-community-cloud)
@@ -56,12 +57,14 @@ There are two cutting modes:
 .
 ├── clipper.py               # Core library + CLI (validation, yt-dlp/ffmpeg logic)
 ├── app.py                   # Streamlit web interface
+├── service.py               # Shared queue, cache, rate limits for many users
 ├── requirements.txt         # Runtime dependencies (also read by Streamlit Cloud)
 ├── requirements-dev.txt     # + pytest, ruff
 ├── packages.txt             # apt packages for Streamlit Cloud (ffmpeg)
 ├── pyproject.toml           # ruff + pytest configuration
 ├── tests/
-│   ├── test_clipper.py      # unit tests + real ffmpeg integration test (offline)
+│   ├── test_clipper.py      # unit tests + real ffmpeg integration tests (offline)
+│   ├── test_service.py      # queue/cache/rate-limit tests, incl. concurrency
 │   └── test_app.py          # Streamlit UI tests (AppTest)
 ├── .github/workflows/ci.yml # Lint + test on every push / PR
 └── .gitignore
@@ -241,14 +244,86 @@ Then open <http://localhost:8501>. Paste a URL, set the start and end times,
 pick a quality, and click **Create clip**. The clip appears in a video player,
 along with a **Download MP4** button.
 
-The finished clip is held in memory for the preview and download, and the
-temporary file is deleted right away. **Clear** frees that memory.
-Server-side limits are configurable through environment variables:
+If a clip has already been made by anyone (same video, times, quality and
+mode), it is served instantly from the server's cache. The **Server status**
+panel at the bottom shows running jobs, the queue, and the YouTube request
+budget.
+
+## Serving many users
+
+The web app is designed to run on **one free server** (such as Streamlit
+Community Cloud) and stay usable when many people use it at once. Every browser
+session goes through one shared `ClipService` (`service.py`):
+
+```
+request ─► validate ─► disk cache hit? ──yes──► serve instantly (no YouTube call, no CPU)
+                           │ no
+                           ▼
+            per-user limit (new clips / hour)
+                           ▼
+            same clip already being made? ──yes──► wait for it and share the result
+                           │ no
+                           ▼
+            server-wide YouTube budget (fetches / hour)
+                           ▼
+            FIFO job queue (max N ffmpeg jobs at once; others see their position)
+                           ▼
+            yt-dlp + ffmpeg (capped threads, fast x264 preset) ─► cache ─► serve
+```
+
+| Problem with many users | What handles it |
+|---|---|
+| Several ffmpeg encodes at once exhaust CPU and RAM and crash the app | **Job queue**: only `CLIPPER_MAX_CONCURRENT_JOBS` jobs run. Others wait in order and see their queue position. Once the queue is full, new requests are turned away immediately with "server at capacity", instead of piling up. |
+| Popular clips get made over and over | **Disk cache** (LRU, with a TTL and a size cap). It is keyed by video, start, end, quality and mode, so a cache hit needs no YouTube request and no CPU. |
+| Two people request the same clip at the same moment | **Single-flight**: the second request waits for the first job instead of starting a duplicate. |
+| Each new clip of the same video re-fetches its metadata | **Metadata cache** (10 minutes). If a cached stream URL has expired, the metadata is re-fetched automatically. |
+| One user spams requests | **Per-user limit** on *new* clips per hour (cache hits don't count). |
+| YouTube bot-blocks the server's IP, which breaks the app for everyone | **Server-wide YouTube budget** per hour. This is the most important limit, because all users share one IP address. |
+| Each session holds video bytes in RAM | Sessions store only a **file path**. Streamlit de-duplicates identical media, so many viewers of one clip share one copy in memory, and the download file is read only when someone clicks the button. |
+| ffmpeg uses every core for each job | `-threads` is capped per job, and precise mode uses the `veryfast` x264 preset. In a local benchmark (20 s of 720p, 2 threads) it encoded 2.8× faster than the default `medium`. On real footage, expect somewhat larger files at similar quality. |
+
+### Configuration
+
+All settings are environment variables. On Streamlit Cloud, set them as
+root-level **Secrets** (see [deployment](#deploying-to-streamlit-community-cloud)).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CLIPPER_MAX_CLIP_SECONDS` | `600` | Longest clip the UI allows (10 minutes) |
-| `CLIPPER_MAX_FILE_MB` | `200` | Largest clip file the UI will serve |
+| `CLIPPER_MAX_CONCURRENT_JOBS` | `2` | ffmpeg jobs that may run at the same time |
+| `CLIPPER_MAX_QUEUE` | `20` | Requests allowed to wait. Beyond this, "server at capacity" |
+| `CLIPPER_QUEUE_TIMEOUT_S` | `300` | Longest wait in the queue before giving up |
+| `CLIPPER_FFMPEG_THREADS` | `2` | CPU threads per ffmpeg job |
+| `CLIPPER_ENCODER_PRESET` | `veryfast` | x264 preset for precise mode (`ultrafast` … `medium`) |
+| `CLIPPER_CACHE_DIR` | `<tmp>/clipper-cache` | Where finished clips are cached |
+| `CLIPPER_CACHE_MB` | `1024` | Cache size budget. Least recently used clips are evicted first |
+| `CLIPPER_CACHE_TTL_HOURS` | `24` | Maximum age of a cached clip |
+| `CLIPPER_INFO_CACHE_TTL_S` | `600` | How long video metadata is reused |
+| `CLIPPER_USER_CLIPS_PER_HOUR` | `10` | New (uncached) clips per user session per hour (`0` = unlimited) |
+| `CLIPPER_GLOBAL_FETCHES_PER_HOUR` | `100` | YouTube downloads per hour for the whole server (`0` = unlimited) |
+| `CLIPPER_MAX_CLIP_SECONDS` | `600` | Longest clip allowed |
+| `CLIPPER_MAX_FILE_MB` | `100` | Largest clip file allowed |
+
+**Tuning rule of thumb:** `MAX_CONCURRENT_JOBS × FFMPEG_THREADS ≈ CPU cores`.
+If YouTube starts showing bot checks, lower `GLOBAL_FETCHES_PER_HOUR`. If
+memory is tight, lower `MAX_FILE_MB` and `MAX_CONCURRENT_JOBS`.
+
+### Limits of this design
+
+- **Single process only.** Queues, caches and limits live in memory, so they
+  are not shared between replicas and they reset when the app restarts (the
+  disk cache also disappears when the container is replaced). This fits free
+  single-container hosting.
+- **Per-user limits are per browser session.** Opening a new tab gives a new
+  session. Real per-person limits need logins. The server-wide YouTube budget
+  is what actually protects the server.
+- **Capacity is bounded by the hardware.** Free hosting has little CPU, so
+  under load, expect queueing rather than parallelism. Fast mode (no re-encode)
+  is far cheaper than precise mode.
+- **Scaling beyond one machine** means replacing the classes in `service.py`
+  with shared equivalents: a Redis-backed queue, limiter and lock, shared or
+  object storage for the cache, and separate worker processes running the
+  downloads. The `ClipService.get_clip()` interface is meant to stay the same,
+  but that requires paid infrastructure and is not built here.
 
 ## Running tests and linting
 
@@ -270,6 +345,11 @@ The test suite needs **no internet access**:
   yt-dlp + ffmpeg section download. It checks that the clip is 4.5 s ± 0.15 s
   long and that no temporary files are left behind. It is skipped if ffmpeg is
   not installed.
+- **The service tests** check concurrency directly: that the job cap is never
+  exceeded, the queue is FIFO, it rejects requests when full, aborted waiters
+  give up their place, simultaneous identical requests run only once, cache
+  LRU/TTL eviction works, and rate-limit windows behave correctly. Another
+  real-ffmpeg test runs 6 simultaneous users through the service.
 - **The UI tests** drive `app.py` with Streamlit's `AppTest`.
 - **An optional live YouTube test** runs only when you opt in:
   `CLIPPER_NETWORK_TESTS=1 pytest -m network`.
@@ -321,11 +401,12 @@ The repository already contains everything the deploy needs:
    - **Main file path:** `app.py`
    - **App URL:** pick a subdomain (optional)
 5. Open **Advanced settings** and set **Python version** to `3.12`. If you want
-   to change the limits, add them under **Secrets** as root-level keys, for
-   example:
+   to change the limits (see [Configuration](#configuration)), add them under
+   **Secrets** as root-level keys, for example:
    ```toml
+   CLIPPER_MAX_CONCURRENT_JOBS = "2"
+   CLIPPER_GLOBAL_FETCHES_PER_HOUR = "60"
    CLIPPER_MAX_CLIP_SECONDS = "300"
-   CLIPPER_MAX_FILE_MB = "100"
    ```
 6. Click **Deploy**. The first build installs ffmpeg and the dependencies, which
    takes a few minutes. You can follow the logs from **Manage app** (bottom
@@ -374,11 +455,7 @@ The repository already contains everything the deploy needs:
 - **Temporary files** live in a private `tempfile.TemporaryDirectory`. Only the
   finished clip is moved to the destination, so partial files never appear
   next to your output.
-- **Web UI memory.** The clip bytes are kept in session state so they can be
-  previewed and downloaded. The clip-length and file-size limits keep that
-  bounded on small hosts. A multi-user production deployment would also need
-  per-user rate limiting and a job queue, both outside the scope of this
-  project.
+- **Many users.** See [Serving many users](#serving-many-users).
 - **yt-dlp is pinned with a minimum version (`>=`), not an exact version.**
   Exact pins make builds reproducible, but an outdated yt-dlp stops working
   with YouTube within weeks, which is the bigger risk for this tool.

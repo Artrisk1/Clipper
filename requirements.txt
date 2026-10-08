@@ -4,4 +4,4 @@
 yt-dlp[default]>=2025.11.12
 # JavaScript runtime required by yt-dlp for YouTube (installs a deno binary).
 deno>=2.3
-streamlit>=1.50
+streamlit>=1.52  # 1.52+ for deferred (lazy) download buttons
